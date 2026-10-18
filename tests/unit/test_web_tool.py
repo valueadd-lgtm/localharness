@@ -4,11 +4,16 @@ from __future__ import annotations
 import sys
 import types
 
+import httpx
 import pytest
 
 from localharness.agent.context import ContentStore
 from localharness.tools.builtin import web_tool
-from localharness.tools.builtin.web_tool import WebFetchTool, WebPageQueryTool, WebSearchTool
+from localharness.tools.builtin.web_tool import (
+    WebFetchTool,
+    WebPageQueryTool,
+    WebSearchTool,
+)
 from tests.unit.test_web_fetch_guard import public_web
 
 
@@ -128,6 +133,82 @@ async def test_web_search_searxng_when_env_set(monkeypatch):
     assert result.output.startswith(web_tool._UNTRUSTED)
     assert "https://sx.test/1" in result.output
     assert "sx snippet" in result.output
+
+
+def _youcom_httpx(monkeypatch, *, json_data):
+    """Patch httpx.AsyncClient for the You.com search path (supports GET + POST)."""
+    class _Resp:
+        def __init__(self):
+            self.status_code = 200
+        def raise_for_status(self): pass
+        def json(self): return json_data
+    class _Client:
+        def __init__(self, *a, **k): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def get(self, url, **k): return _Resp()
+        async def post(self, url, **k): return _Resp()
+    monkeypatch.setattr(web_tool.httpx, "AsyncClient", _Client)
+
+
+@pytest.mark.asyncio
+async def test_web_search_youcom_keyless_when_env_set(monkeypatch):
+    monkeypatch.setattr(web_tool, "_SEARXNG_URL", None)
+    monkeypatch.setattr(web_tool, "_YOUCOM", "1")
+    monkeypatch.setattr(web_tool, "_YDC_API_KEY", None)
+    _youcom_httpx(monkeypatch, json_data={"results": {"web": [
+        {"title": "Y1", "url": "https://y.test/1", "description": "you keyless snippet"},
+    ]}})
+    result = await WebSearchTool().run(query="qnt")
+    assert result.success is True
+    assert result.output.startswith(web_tool._UNTRUSTED)
+    assert "https://y.test/1" in result.output
+    assert "you keyless snippet" in result.output
+
+
+@pytest.mark.asyncio
+async def test_web_search_youcom_keyed_flattens_flat_results(monkeypatch):
+    monkeypatch.setattr(web_tool, "_SEARXNG_URL", None)
+    monkeypatch.setattr(web_tool, "_YOUCOM", "1")
+    monkeypatch.setattr(web_tool, "_YDC_API_KEY", "test-key")
+    _youcom_httpx(monkeypatch, json_data={"results": [
+        {"title": "Y2", "url": "https://y.test/2", "snippet": "keyed snippet"},
+    ]})
+    result = await WebSearchTool().run(query="qnt")
+    assert result.success is True
+    assert "https://y.test/2" in result.output
+    assert "keyed snippet" in result.output
+
+
+@pytest.mark.asyncio
+async def test_web_search_youcom_drops_hits_without_url(monkeypatch):
+    monkeypatch.setattr(web_tool, "_SEARXNG_URL", None)
+    monkeypatch.setattr(web_tool, "_YOUCOM", "1")
+    monkeypatch.setattr(web_tool, "_YDC_API_KEY", None)
+    _youcom_httpx(monkeypatch, json_data={"results": {"web": [
+        {"title": "no url", "description": "dropped"},
+        {"title": "Y3", "url": "https://y.test/3", "description": "kept snippet"},
+    ]}})
+    result = await WebSearchTool().run(query="qnt")
+    assert result.success is True
+    assert "https://y.test/3" in result.output
+    assert "dropped" not in result.output
+
+
+@pytest.mark.asyncio
+async def test_web_search_youcom_failure_is_error_not_empty(monkeypatch):
+    monkeypatch.setattr(web_tool, "_SEARXNG_URL", None)
+    monkeypatch.setattr(web_tool, "_YOUCOM", "1")
+    monkeypatch.setattr(web_tool, "_YDC_API_KEY", None)
+    class _BoomClient:
+        def __init__(self, *a, **k): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def get(self, url, **k): raise httpx.ConnectError("boom")
+    monkeypatch.setattr(web_tool.httpx, "AsyncClient", _BoomClient)
+    result = await WebSearchTool().run(query="qnt")
+    assert result.success is False
+    assert "web search failed" in result.error
 
 
 # --- P4: lossless retrieve-and-verify (page store + web_page_query) ------------

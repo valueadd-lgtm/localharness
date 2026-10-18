@@ -39,6 +39,13 @@ _UA = "Mozilla/5.0 (compatible; LocalHarness/0.1; +https://localharness.dev)"
 # route web_search through it. Unset (the OSS default) keeps keyless DuckDuckGo.
 _SEARXNG_URL = os.environ.get("LOCALHARNESS_SEARXNG_URL")
 
+# Opt-in You.com web search: set LOCALHARNESS_YOUCOM=1 to route web_search through You.com's
+# Agents API. Keyless by default (100 free searches/day per IP, no key); set YDC_API_KEY to use
+# the keyed endpoint for higher limits. Unset (the OSS default) keeps keyless DuckDuckGo.
+_YOUCOM = os.environ.get("LOCALHARNESS_YOUCOM")
+_YDC_API_KEY = os.environ.get("YDC_API_KEY")
+_YOUCOM_UA = "youdotcom-integration/ahwurm-localharness"
+
 # Every fetched/searched web result is untrusted DATA. Prepended so the model treats any
 # instruction-like text in a page as content to report on, never to follow (injection guard).
 _UNTRUSTED = (
@@ -139,6 +146,48 @@ def _html_to_text(html: str) -> str:
     return text.strip()
 
 
+async def _youcom_search(query: str, max_results: int) -> list[dict[str, str]]:
+    """Query You.com's Agents API and normalize hits to the web_search formatter shape.
+
+    Keyless by default (``GET https://api.you.com/v1/agents/search``, 100/day per IP, no key);
+    when ``YDC_API_KEY`` is set, uses the keyed ``POST`` endpoint for higher limits. The two
+    variants return different shapes — keyless nests under ``results.web``; keyed returns a
+    flat ``results`` array — so both are handled and capped at ``max_results``.
+    """
+    headers = {"User-Agent": _YOUCOM_UA}
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        if _YDC_API_KEY:
+            resp = await client.post(
+                "https://api.you.com/v1/agents/search",
+                headers={**headers, "X-API-Key": _YDC_API_KEY, "Content-Type": "application/json"},
+                json={"query": query, "max_results": max_results},
+            )
+        else:
+            resp = await client.get(
+                "https://api.you.com/v1/agents/search",
+                headers=headers,
+                params={"query": query, "max_results": max_results},
+            )
+        resp.raise_for_status()
+    data = resp.json().get("results", [])
+    # Keyless -> {"web": [...]}; keyed -> flat array. Array.isArray check detects which.
+    raw = data if isinstance(data, list) else data.get("web", [])
+    hits: list[dict[str, str]] = []
+    for r in raw[:max_results]:
+        if not isinstance(r, dict):
+            continue
+        url = (r.get("url") or "").strip()
+        if not url:
+            continue  # MINIMAL: drop malformed hits; ceiling is per-result field validation
+        snippet = r.get("snippet")
+        if snippet is None:
+            snips = r.get("snippets")
+            snippet = snips[0] if isinstance(snips, list) and snips else ""
+        hits.append({"title": (r.get("title") or "").strip(), "url": url,
+                      "snippet": (snippet or r.get("description") or "").strip()[:240]})
+    return hits
+
+
 class WebSearchTool(Tool):
     timeout_s = 25.0
 
@@ -175,6 +224,11 @@ class WebSearchTool(Tool):
                     resp = await client.get(_SEARXNG_URL, params={"q": query, "format": "json"})
                     resp.raise_for_status()
                     results = resp.json().get("results", [])[:max_results]
+            except Exception as exc:  # noqa: BLE001
+                return self.err(f"web search failed: {exc}")
+        elif _YOUCOM:
+            try:
+                results = await _youcom_search(query, max_results)
             except Exception as exc:  # noqa: BLE001
                 return self.err(f"web search failed: {exc}")
         else:
